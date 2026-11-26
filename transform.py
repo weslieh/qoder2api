@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import copy
 import json
 
+import identity_guard
+
 
 @dataclass
 class BridgeDelta:
@@ -531,6 +533,12 @@ def _build_qoder_messages(
     if not rebuilt and prompt.strip():
         rebuilt.append(_build_user_message(prompt))
 
+    # 出站身份句守卫: 只中和 system 消息开头部分, 打断上游对第三方 Agent
+    # 身份声明句的字面检测 (详见 identity_guard)。无命中时零改动。
+    rebuilt, guard_hits = identity_guard.neutralize_system_messages(rebuilt)
+    if guard_hits:
+        print(f"[guard] neutralized {guard_hits} identity sentence(s) in system prompt")
+
     return rebuilt
 
 
@@ -595,13 +603,41 @@ def _make_sse_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+_SSE_DONE = "[DONE]"
+
+
+def _is_sse_done(payload) -> bool:
+    """判断一行 SSE 的数据部分是否为流结束标记。
+
+    网关两种形态都有：裸 ``data: [DONE]``，以及信封形态
+    ``data:{"headers":{...},"body":"[DONE]","statusCodeValue":200}``。
+    """
+    if isinstance(payload, str):
+        return payload.strip() == _SSE_DONE
+    if isinstance(payload, dict):
+        body = payload.get("body")
+        return isinstance(body, str) and body.strip() == _SSE_DONE
+    return False
+
+
 def _extract_delta(data_line: str) -> BridgeDelta:
+    if not data_line:
+        return BridgeDelta()
+    if _is_sse_done(data_line):
+        return BridgeDelta()
     try:
         wrapper = json.loads(data_line)
+        # 裸 [DONE] / 非信封 JSON（如纯数组）不携带增量
+        if not isinstance(wrapper, dict):
+            return BridgeDelta()
+        if _is_sse_done(wrapper):
+            return BridgeDelta()
         inner_str = wrapper.get("body", "")
-        if not inner_str:
+        if not inner_str or not isinstance(inner_str, str):
             return BridgeDelta()
         inner_json = json.loads(inner_str)
+        if not isinstance(inner_json, dict):
+            return BridgeDelta()
         for ch in inner_json.get("choices", []):
             delta = ch.get("delta", {})
             role = delta.get("role", "")

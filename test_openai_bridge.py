@@ -1,8 +1,12 @@
 import asyncio
+import contextlib
+import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 
+import identity_guard
 import models
 import transform
 import openai_bridge
@@ -106,6 +110,29 @@ class PureOpenAiBridgeTests(unittest.TestCase):
         delta = transform._extract_delta(line)
         self.assertEqual(delta.reasoning_content, "thinking...")
         self.assertFalse(delta.is_empty())
+
+    def test_extract_delta_ignores_envelope_done_marker(self):
+        # 网关的正常流结束帧: body 是字面量 "[DONE]", 不是 JSON
+        line = json.dumps(
+            {
+                "headers": {"Content-Type": ["application/json"]},
+                "body": "[DONE]",
+                "statusCodeValue": 200,
+                "statusCode": "OK",
+            }
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            delta = transform._extract_delta(line)
+        self.assertTrue(delta.is_empty())
+        self.assertEqual(buf.getvalue(), "")  # 正常终止不应打 skip 日志
+
+    def test_extract_delta_ignores_bare_done_marker(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            delta = transform._extract_delta("[DONE]")
+        self.assertTrue(delta.is_empty())
+        self.assertEqual(buf.getvalue(), "")
 
     def test_make_sse_chunk_outputs_reasoning_content_when_present(self):
         chunk = transform._make_sse_chunk(
@@ -431,6 +458,109 @@ class PureOpenAiBridgeTests(unittest.TestCase):
         finally:
             openai_bridge._BRIDGE_TTL_SEC = 30 * 60
             openai_bridge._BRIDGE_SWEEP_EVERY = 64
+
+
+class IdentityGuardTests(unittest.TestCase):
+    """身份句中和: 只动 system 消息开头, 最小字符级改写。"""
+
+    def test_identity_sentence_is_neutralized(self):
+        text = "You are Claude Code, Anthropic's official CLI tool."
+        new, hits = identity_guard.neutralize_text(text)
+        self.assertEqual(hits, 1)
+        self.assertTrue(new.startswith("You are Claude Code ,"))
+        # 品牌名与语义完整保留, 只多一个空格
+        self.assertIn("Anthropic's official CLI tool.", new)
+
+    def test_powered_by_sentence_is_neutralized(self):
+        new, hits = identity_guard.neutralize_text("powered by DeepSeek Harness.")
+        self.assertEqual(hits, 1)
+        self.assertEqual(new, "powered by DeepSeek Harness .")
+
+    def test_benign_text_is_untouched(self):
+        text = "You are a helpful assistant, working with the user."
+        new, hits = identity_guard.neutralize_text(text)
+        self.assertEqual(hits, 0)
+        self.assertIs(new, text)  # 零改动 = 同一对象
+
+    def test_loose_spacing_does_not_match(self):
+        # 上游口径要求标点紧跟品牌名; 已中和的文本天然不命中 (幂等)
+        text = "You are Claude Code , a tool."
+        new, hits = identity_guard.neutralize_text(text)
+        self.assertEqual(hits, 0)
+        self.assertIs(new, text)
+
+    def test_neutralization_is_idempotent(self):
+        once, _ = identity_guard.neutralize_text("You are Codex, a tool.")
+        twice, hits = identity_guard.neutralize_text(once)
+        self.assertEqual(hits, 0)
+        self.assertEqual(twice, once)
+
+    def test_only_prefix_window_is_scanned(self):
+        text = "x" * 50 + "You are ZCode,"
+        new, hits = identity_guard.neutralize_text(text, limit=10)
+        self.assertEqual(hits, 0)
+        self.assertIs(new, text)
+        new2, hits2 = identity_guard.neutralize_text(text, limit=200)
+        self.assertEqual(hits2, 1)
+        self.assertEqual(new2, "x" * 50 + "You are ZCode ,")
+
+    def test_text_beyond_prefix_window_is_preserved(self):
+        text = "You are ZCode, " + "y" * 500
+        new, hits = identity_guard.neutralize_text(text, limit=20)
+        self.assertEqual(hits, 1)
+        self.assertEqual(new, "You are ZCode , " + "y" * 500)
+
+    def test_only_system_messages_are_touched(self):
+        messages = [
+            {"role": "system", "content": "You are Claude Code, a CLI tool."},
+            {"role": "user", "content": "You are Claude Code, right?"},
+            {"role": "assistant", "content": "You are Codex, said the model."},
+        ]
+        out, hits = identity_guard.neutralize_system_messages(messages)
+        self.assertEqual(hits, 1)
+        self.assertTrue(out[0]["content"].startswith("You are Claude Code ,"))
+        self.assertIs(out[1], messages[1])  # user 原样
+        self.assertIs(out[2], messages[2])  # assistant 原样
+
+    def test_multimodal_system_content_parts(self):
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "You are Codex, be terse."},
+                    {"type": "text", "text": "no identity here"},
+                ],
+            }
+        ]
+        out, hits = identity_guard.neutralize_system_messages(messages)
+        self.assertEqual(hits, 1)
+        parts = out[0]["content"]
+        self.assertEqual(parts[0]["text"], "You are Codex , be terse.")
+        self.assertEqual(parts[1]["text"], "no identity here")
+
+    def test_guard_can_be_disabled_by_env(self):
+        messages = [{"role": "system", "content": "You are Codex, a tool."}]
+        with patch.dict(os.environ, {"QODER_IDENTITY_GUARD": "0"}):
+            self.assertFalse(identity_guard.guard_enabled())
+            out, hits = identity_guard.neutralize_system_messages(messages)
+        self.assertEqual(hits, 0)
+        self.assertIs(out, messages)
+
+    def test_guard_is_enabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(identity_guard.guard_enabled())
+
+    def test_build_qoder_messages_applies_guard_to_system_only(self):
+        messages = [
+            {"role": "system", "content": "You are Claude Code, a CLI tool."},
+            {"role": "user", "content": "You are Claude Code, right?"},
+        ]
+        built = transform._build_qoder_messages(
+            messages, "You are Claude Code, right?", False
+        )
+        self.assertEqual(built[0]["role"], "system")
+        self.assertTrue(built[0]["content"].startswith("You are Claude Code ,"))
+        self.assertIn("You are Claude Code, right?", built[1]["contents"][-1]["text"])
 
 
 def transform_identity_stub():

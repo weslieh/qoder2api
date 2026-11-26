@@ -105,8 +105,35 @@ python openai_bridge.py           # 默认 127.0.0.1:8963
 | `QODER_HOST` | `127.0.0.1`（本地）/ `0.0.0.0`（容器） | 监听地址 |
 | `QODER_PORT` | `8963` | 监听端口 |
 | `QODER_SIGNATURE_SECRET` | 内置默认 | cosy 请求签名密钥（一般无需改） |
+| `QODER_IDENTITY_GUARD` | 开启 | 出站 system prompt 身份句中和开关，`0/off/false/no` 关闭（见下文） |
+| `QODER_IDENTITY_GUARD_PREFIX` | `2000` | 中和时只扫 system prompt 的前 N 个字符，`<=0` 表示不限 |
 
 PAT **不**配置在环境里，由客户端每次请求通过 `Authorization: Bearer <PAT>` 提供，服务端按 PAT 哈希建立独立 Bridge 实例池。
+
+---
+
+## 身份句中和（上游兼容）
+
+上游网关对第三方 Agent 客户端的**身份声明句**做大小写敏感的字面检测，命中即返回
+HTTP 200 + SSE 内嵌 `403 / RESOURCE_LIMIT` 排队信封（硬拒绝，重试无效）：
+
+```
+"You are Claude Code,"               命中      "You are Claude Code ,"            不命中
+"You are Codex,"                     命中      "You are Codex."                   不命中（无逗号）
+"powered by DeepSeek Harness."       命中      "powered by the DeepSeek Harness." 不命中
+```
+
+`identity_guard.py` 的做法是**最小字符级中和**：只在命中片段的标点前插一个空格，
+品牌名、语序、语义全部保留，模型看到的仍是完整的自我认知与工具指令；未命中的文本
+零改动（返回同一对象，前缀字节不变，缓存不受影响），改写确定且幂等。
+
+处理范围刻意收窄，避免全文正则的开销：
+
+- 只处理 `role == "system"` 的消息（user / assistant / tool 历史不动）
+- 只扫 system prompt 的**前 2000 字符**（身份句都在开头），可用
+  `QODER_IDENTITY_GUARD_PREFIX` 调整
+- 开关默认开启，`QODER_IDENTITY_GUARD=0` 关闭；命中时日志打印
+  `[guard] neutralized N identity sentence(s) in system prompt`
 
 ---
 
@@ -206,6 +233,7 @@ qoder2api/
 ├── openai_bridge.py        # FastAPI 入口 + OpenAiBridge(会话/流式转发) + 路由
 ├── qoder_auth.py           # Qoder 认证/签名/HTTP 客户端 (纯 Python 复刻 wasm)
 ├── transform.py            # OpenAI ↔ Qoder 消息转换 + 流式累积器
+├── identity_guard.py       # 出站 system prompt 身份句中和 (上游字面检测规避)
 ├── models.py               # 模型目录: 动态解析 + 内置兜底表
 ├── baseprompt.json         # Qoder 请求体模板
 ├── test_openai_bridge.py   # 单元测试
@@ -241,10 +269,10 @@ DEFAULT_MODEL_MAP = { "Qwen3.7-Max": "qmodel_latest", ... }  # 9 个
 ## 测试
 
 ```bash
-python -m unittest test_openai_bridge -v   # 19 个测试, 无需联网/PAT
+python -m unittest test_openai_bridge -v   # 39 个测试, 无需联网/PAT
 ```
 
-覆盖：模型解析、视觉能力判定、消息转换、流式累积、tool calls、错误 chunk、路由鉴权等。
+覆盖：模型解析、视觉能力判定、消息转换、流式累积、tool calls、错误 chunk、路由鉴权、身份句中和等。
 
 ---
 
